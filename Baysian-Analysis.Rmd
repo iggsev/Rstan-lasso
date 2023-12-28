@@ -1,0 +1,524 @@
+---
+title: "Bayesian Analysis of Customer Churn"
+author: "Igor Gusev"
+date: "12/27/2023"
+output: html_document
+---
+
+## Introduction
+
+In this study, we undertake a Bayesian analytical approach to explore the factors influencing customer decisions to churn (cancel services) in a hypothetical telecommunications company. Our primary aim is to construct an ideal model that accurately identifies the most relevant parameters influencing a customer's decision to cancel their service. 
+
+To achieve this, we will embark on a journey of model development and refinement, starting with a base model. This model will be our initial attempt at understanding the churn behavior. Recognizing the potential for model improvement, we will then incorporate informative priors through a LASSO approach, aiming to enhance the model's performance and focus on the most significant predictors. Finally, we will streamline our model by removing less informative variables, creating a more efficient and interpretable model.
+
+Throughout this process, we emphasize the importance of rigorous diagnostics and adjustments. By systematically analyzing and enhancing our model, we aim to strike a balance between complexity and interpretability, ensuring our model is both accurate and insightful. The outcome will be a comprehensive Bayesian analysis, shedding light on the intricacies of customer churn in the telecom sector.
+
+
+## Setting Up the Environment
+
+We begin by installing and loading the necessary R packages. These packages will provide us with tools for Bayesian analysis, data manipulation, and visualization.
+
+```{r setup, message=FALSE, warning=FALSE}
+options(repos = c(CRAN = "http://cran.rstudio.com/"))
+
+# Installing necessary libraries
+# install.packages("rstan")
+# install.packages("modeldata")
+# install.packages("ggplot2")
+# install.packages("heatmaply")
+# install.packages("loo")
+# install.packages("bayesplot")
+
+# Loading the libraries
+library(rstan)
+library(modeldata)
+library(ggplot2)
+library(heatmaply)
+library(loo)
+library(bayesplot)
+```
+
+## Data Description and Loading
+
+The dataset utilized in this analysis, known as "Customer Churn Data," is obtained from the "modeldata" package. Although these data are artificial, they have been constructed to mirror patterns and characteristics found in real-world business scenarios, specifically within the telecommunications sector. This alignment with real-world scenarios ensures that our analysis and conclusions are grounded in practical and applicable contexts.
+
+In our pursuit of a simplified and focused analysis, we elected to exclude the variable related to the voice mail plan. Additionally, to streamline our data, we consolidated variables related to daily usage periods (morning, afternoon, and night) into a single representative variable for total daily usage. 
+
+Key variables in our analysis include:
+- **international_plan**: A binary variable (factor), indicating the presence ("yes") or absence ("no") of an international plan.
+- **total_minutes** (total_day_minutes + total_eve_minutes + total_night_minutes): A numeric variable representing the sum of minutes used during the day, evening, and night.
+- **total_calls** (total_day_calls + total_eve_calls + total_night_calls): An integer variable indicating the total number of calls made during the day, evening, and night.
+- **total_charge** (total_day_charge + total_eve_charge + total_night_charge): A numeric variable summarizing the charges for service use throughout the day, evening, and night.
+- **total_intl_minutes**: A numeric variable for the total minutes in international calls.
+- **total_intl_calls**: An integer variable for the total number of international calls.
+- **total_intl_charge**: A numeric variable for the total charges for international calls.
+- **number_customer_service_calls**: An integer variable indicating the number of calls to customer service.
+- **churn**: A binary variable (factor), signifying service cancellation ("yes") or continuation ("no").
+
+```{r}
+# Load the Customer churn data
+data("mlc_churn", package = "modeldata")
+
+# Adjust 'yes' and 'no' to 1 and 0 in necessary columns
+mlc_churn$churn <- as.integer(mlc_churn$churn == "yes")
+mlc_churn$international_plan <- as.integer(mlc_churn$international_plan == "yes")
+
+# Select and transform desired columns
+mlc_filtered <- mlc_churn[, c(
+  "international_plan",
+  "total_day_minutes",
+  "total_day_calls",
+  "total_day_charge",
+  "total_eve_minutes",
+  "total_eve_calls",
+  "total_eve_charge",
+  "total_night_minutes",
+  "total_night_calls",
+  "total_night_charge",
+  "total_intl_minutes",
+  "total_intl_calls",
+  "total_intl_charge",
+  "number_customer_service_calls",
+  "churn"
+)]
+
+# Create aggregated features
+mlc_filtered$total_calls <- rowSums(mlc_filtered[, c("total_day_calls", "total_eve_calls", "total_night_calls")])
+mlc_filtered$total_minutes <- rowSums(mlc_filtered[, c("total_day_minutes", "total_eve_minutes", "total_night_minutes")])
+mlc_filtered$total_charge <- rowSums(mlc_filtered[, c("total_day_charge", "total_eve_charge", "total_night_charge")])
+
+# Remove original columns
+mlc_filtered <- mlc_filtered[, !(colnames(mlc_filtered) %in% c("total_day_calls", "total_day_minutes", "total_day_charge", "total_eve_calls", "total_eve_minutes", "total_eve_charge", "total_night_calls", "total_night_minutes", "total_night_charge"))]
+
+```
+### Data Selection and Scaling
+
+Before fitting the model, we select and order the desired columns in the dataset. We also scale the predictors to ensure they are on the same scale. This step is crucial for the performance of the model.
+
+
+```{r}
+# Select and order desired columns for the model
+cols_to_plot <- c(
+  "international_plan", 
+  "total_charge", 
+  "total_minutes",
+  "total_calls",
+  "total_intl_charge",
+  "total_intl_minutes",
+  "total_intl_calls",
+  "number_customer_service_calls",
+  "churn"
+)
+
+# Calculate the number of predictors
+k <- length(cols_to_plot) - 1
+
+# Select columns and scale the predictors
+mlc_filtered <- mlc_filtered[, cols_to_plot]
+mlc_filtered[, -ncol(mlc_filtered)] <- scale(mlc_filtered[, -ncol(mlc_filtered)])
+```
+
+## Stan Model for Churn Analysis
+
+We will now define our Bayesian model using Stan, a powerful tool for statistical modeling and high-performance statistical computation. The model aims to understand the factors influencing customer churn.
+
+### Model Specification
+
+The first Stan model is specified as follows:
+
+- **Data block**: Defines the data input for the model, including the number of observations `N`, the number of predictors `K`, the matrix of predictors `x`, and the binary response variable `y`.
+- **Parameters block**: Specifies the model parameters, including the intercept `alpha` and the coefficients `beta`.
+- **Model block**: Describes the model itself. In this version, we simply model the likelihood of the response `y` as a Bernoulli distribution with a logit link function, without implementing LASSO regularization.
+- **Generated quantities block**: Calculates the log-likelihood for each observation, which is useful for model diagnostics and comparison.
+
+This model serves as a baseline for comparison with more complex models, such as those including LASSO regularization.
+
+```{r}
+stan_code <- "
+data {
+  int<lower=0> N;
+  int<lower=0> K; 
+  matrix[N, K] x; 
+  array[N] int<lower=0, upper=1> y;
+}
+parameters {
+  real alpha;
+  vector[K] beta;
+}
+model {
+  y ~ bernoulli_logit(x * beta + alpha);
+}
+generated quantities {
+  vector[N] log_lik;
+  for (n in 1:N) {
+    log_lik[n] = bernoulli_logit_lpmf(y[n] | x[n] * beta + alpha);
+  }
+}
+"
+```
+
+## Model Execution
+
+With the Stan model defined, the next step is to execute the model using the `stan` function from the `rstan` package. This involves setting up the data for the model, fitting the model, and extracting the posterior distributions of the model parameters.
+
+### Preparing Data for Stan Model
+
+First, we prepare the data in the format required by the Stan model. This includes the number of observations, the predictor matrix, the response variable.
+
+```{r}
+# Prepare data for Stan model
+stan_data <- list(
+  N = nrow(mlc_filtered),
+  x = as.matrix(mlc_filtered[, -ncol(mlc_filtered)]),
+  y = mlc_filtered$churn,
+  K = k  # Number of predictors
+)
+
+```
+
+### Fitting the Model
+
+Now we fit the model using the `stan` function. This process involves specifying the model code, data, number of chains, iterations, and cores for parallel computation.
+
+
+```{r}
+num_iter = 1000  # Number of iterations
+start_time <- Sys.time()
+stan_fit <- stan(model_code = stan_code, data = stan_data, chains = 2, iter = num_iter, cores = 4)
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+```
+
+
+## Model Diagnostics
+
+After fitting the Stan model, performing a comprehensive diagnostic analysis is essential to assess the quality of the fit and the reliability of the model. This analysis involves several key metrics and tests.
+
+### Effective Sample Size (ESS) and Rhat Diagnostics
+
+The Effective Sample Size (ESS) provides an estimate of the number of independent samples equivalent to the correlated samples drawn from the Markov Chain. A higher ESS indicates better precision and reliability of the estimates, suggesting that the sampling process is adequately exploring the posterior distribution.
+
+The Rhat statistic is a measure of convergence. It compares the variance within each chain to the variance between chains. Values of Rhat close to 1 (typically less than 1.1) indicate that all chains have converged to the same distribution, ensuring that our inferences are based on a stable posterior distribution.
+
+### Leave-One-Out Cross-Validation (LOO)
+
+LOO Cross-Validation is used to estimate the out-of-sample predictive accuracy of the model. It involves removing one observation at a time and predicting its value using the model fitted on the remaining data. Key metrics from the LOO analysis include the `elpd_loo` (expected log pointwise predictive density), which quantifies the model's predictive accuracy, `p_loo`, which estimates the effective number of parameters, and `looic` (LOO information criterion), a measure for model comparison.
+
+### Hamiltonian Monte Carlo (HMC) Diagnostics
+
+HMC Diagnostics are crucial for assessing the performance of the sampling algorithm. We examine the number of divergent iterations and the number of iterations that hit the maximum tree depth. A high number of divergent iterations may indicate issues with the model such as extreme curvature. Similarly, hitting the maximum tree depth frequently can suggest that the algorithm is struggling to explore the posterior effectively.
+
+### Diagnostic Summary
+
+We combine these diagnostics into a comprehensive summary, using custom functions to extract and collate key metrics from the model. This summary includes the average ESS and Rhat across all parameters, alongside the LOO and HMC diagnostics, providing a holistic view of the model's performance and reliability.
+
+
+
+```{r}
+
+create_parameter_names <- function(k) {
+  pars <- character(k + 1)
+  for (i in 1:k) {
+    pars[i] <- paste("beta[", i, "]", sep = "")
+  }
+  pars[k + 1] <- "alpha"
+  return(pars)
+}
+
+pars <- create_parameter_names(k)
+
+extract_diagnostics <- function(stan_fit, pars) {
+  # Extract diagnostics from the Stan model summary
+  summary_stan <- summary(stan_fit)$summary
+  params_mean_sd <- summary_stan[pars, c("mean", "sd")]
+  params_ess <- summary_stan[pars, "n_eff"]
+  params_rhat <- summary_stan[pars, "Rhat"]
+  params_diagnostics <- data.frame(params_mean_sd, ESS = params_ess, Rhat = params_rhat)
+
+  # Return the diagnostics
+  return(params_diagnostics)
+}
+
+
+model_performance_summary <- function(stan_fit,pars,time,name) {
+  # Calculating LOO results
+  loo_result <- loo(stan_fit)
+  
+  # Extracting key LOO metrics
+  elpd_loo <- loo_result$elpd_loo
+  p_loo <- loo_result$p_loo
+  looic <- loo_result$looic
+  
+  # Checking HMC diagnostics
+  divergences <- sum(get_divergent_iterations(stan_fit))
+  max_treedepth <- sum(get_num_max_treedepth(stan_fit))
+  
+  
+  stan_summary <- summary(stan_fit)$summary
+  stan_summary <- stan_summary[pars, c("n_eff", "Rhat")]
+  
+  mean_ess <- mean(stan_summary[,'n_eff'])
+  mean_rhat <- mean(stan_summary[,'Rhat'])
+  
+  # Creating a dataframe with the results
+  performance_summary_df <- data.frame(
+    name = name,
+    time = time,
+    divergences = divergences,
+    max_treedepth = max_treedepth,
+    elpd_loo = elpd_loo,
+    p_loo = p_loo,
+    looic = looic,
+    mean_ess = mean_ess,
+    mean_rhat = mean_rhat
+  )
+  
+  return(performance_summary_df)
+}
+
+performance_summary_df <- model_performance_summary(stan_fit,pars,execution_time, "Base Model")
+
+diagnostics <- extract_diagnostics(stan_fit, pars)
+print(diagnostics)
+print(performance_summary_df)
+```
+
+
+## Adding LASSO Prior to the Model
+
+Based on the diagnostics and analysis of the initial model, we decide to incorporate a LASSO prior (Laplace prior) for the coefficients. This approach can help in feature selection and potentially improve model performance by imposing shrinkage on the coefficients, which is particularly useful in models with many predictors.
+
+### Updated Stan Model with LASSO Prior
+
+The Stan model is now updated to include a Laplace prior for each coefficient, controlled by the `lambda` parameter. This prior encourages sparsity in the coefficients, which can be beneficial in selecting the most relevant features.
+
+```{r}
+stan_code <- "
+data {
+  int<lower=0> N;
+  int<lower=0> K; 
+  matrix[N, K] x; 
+  array[N] int<lower=0, upper=1> y;
+  real<lower=0> lambda;  // Shrinkage parameter for LASSO
+}
+parameters {
+  real alpha;
+  vector[K] beta;
+}
+model {
+  for (k in 1:K) {
+    beta[k] ~ double_exponential(0, lambda);  // Laplace prior (double_exponential)
+  }
+  y ~ bernoulli_logit(x * beta + alpha);
+}
+generated quantities {
+  vector[N] log_lik;
+  for (n in 1:N) {
+    log_lik[n] = bernoulli_logit_lpmf(y[n] | x[n] * beta + alpha);
+  }
+}
+"
+```
+
+## Executing the Model with LASSO Prior
+
+We now fit the updated Stan model with the LASSO prior. This process involves the same steps as the initial model but with the updated `stan_code`.
+
+### Fitting the Updated Model
+
+```{r}
+stan_data <- list(
+  N = nrow(mlc_filtered),
+  x = as.matrix(mlc_filtered[, -ncol(mlc_filtered)]),
+  y = mlc_filtered$churn,
+  lambda = 1,
+  K = k
+)
+
+start_time <- Sys.time()
+stan_fit_lasso <- stan(model_code = stan_code, data = stan_data, chains = 2, iter = num_iter, cores = 4)
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+```
+
+## Extracting and Analyzing Diagnostics from the LASSO Model
+
+After fitting the Stan model with the LASSO prior, our next step is to extract and analyze its diagnostics. We aim to compare these diagnostics with those from the initial model to assess any improvements in model performance. Specifically, we'll look at key metrics like the mean, standard deviation, effective sample size (ESS), and Rhat for each parameter. Improvements in these diagnostics can indicate a better-fitting and more reliable model.
+
+### Using the Custom Functions for Diagnostic Comparison
+
+To facilitate this comparison, we will use the custom functions `create_parameter_names` and `extract_diagnostics`. `create_parameter_names` generates the vector of parameter names, and `extract_diagnostics` retrieves important diagnostic metrics. By examining these diagnostics side-by-side with those from the initial model, we can gauge the effectiveness of the LASSO prior in enhancing our model.
+
+```{r}
+
+pars <- create_parameter_names(k)
+diagnostics_lasso <- extract_diagnostics(stan_fit_lasso, pars)
+performance_summary_lasso <- model_performance_summary(stan_fit_lasso, pars, execution_time, "Lasso Model")
+
+combined_performance_summary <- rbind(performance_summary_df, performance_summary_lasso)
+
+# Compare performance summary 
+print(combined_performance_summary)
+
+```
+
+## Graphical Analysis of Model Parameters
+
+We now proceed to a graphical analysis of the model parameters to uncover potential correlations and insights.
+
+### Traceplot, Histogram, Autocorrelation, and Areas
+
+First, we visualize the traceplot, histogram, autocorrelation, and comparative distribution areas of the parameters. These visualizations are crucial for assessing convergence, distribution characteristics, and potential autocorrelations between samples.
+
+```{r}
+# Traceplot for convergence and mixing
+traceplot(stan_fit_lasso, pars = pars)
+
+# Histogram of posterior distributions
+mcmc_hist(stan_fit_lasso, pars = pars)
+
+# Autocorrelation function for samples
+mcmc_acf(stan_fit_lasso, pars = pars)
+
+# Comparative visualization of posterior distributions
+mcmc_areas(stan_fit_lasso, pars = pars)
+```
+
+## Simplifying the Model by Removing Irrelevant Parameters
+
+Next, we examine pairs plots for selected parameters to investigate potential correlations. From our previous analysis, we identified that the coefficients corresponding to `beta[3]` and `beta[6]` might be considered irrelevant. This conclusion is based on the observation that their standard deviations exceed their mean values, indicating significant uncertainty.
+
+In light of this finding, we decide to simplify our model by removing these parameters. Specifically, we will remove the variables corresponding to `total minutes` and `total intl minutes`. This simplification aims to improve the interpretability of the results without compromising the model's predictive capability. Removing variables with problematic parameters can often lead to a more robust and interpretable model.
+
+### Pairs Plot Analysis for Selected Parameters
+
+```{r}
+# Pairs plot for beta[2] and beta[3]
+mcmc_pairs(stan_fit_lasso, pars = c("beta[2]", "beta[3]"))
+
+# Pairs plot for beta[5] and beta[6]
+mcmc_pairs(stan_fit_lasso, pars = c("beta[5]", "beta[6]"))
+
+```
+
+## Refitting the Model with Simplified Parameters
+
+After deciding to remove certain parameters, we will now refit the Stan model with a simplified set of predictors. This involves using the already scaled data with the selected columns.
+
+### Selecting Columns for the Simplified Model
+
+First, we adjust our dataset to include only the columns deemed most relevant, based on our previous analysis.
+
+```{r}
+# Select and order desired columns for the model
+cols_to_plot <- c(
+  "international_plan", 
+  "total_charge", 
+  "total_calls",
+  "total_intl_charge",
+  "total_intl_calls",
+  "number_customer_service_calls",
+  "churn"
+)
+
+# Update the dataset with selected columns
+mlc_filtered <- mlc_filtered[, cols_to_plot]
+
+# Calculate the number of predictors
+k <- length(cols_to_plot) - 1
+```
+
+### Refitting the Model
+
+With the revised dataset, we now refit our Stan model. This step involves updating the data input for the model and executing the fitting process again.
+
+```{r}
+# Prepare data for Stan model
+stan_data <- list(
+  N = nrow(mlc_filtered),
+  x = as.matrix(mlc_filtered[, -ncol(mlc_filtered)]),
+  y = mlc_filtered$churn,
+  lambda = 1,  # Shrinkage parameter for LASSO (used in later models)
+  K = k  # Number of predictors
+)
+
+# Fit the model with the updated data
+start_time <- Sys.time()
+stan_fit_updated <- stan(model_code = stan_code, data = stan_data, chains = 2, iter = num_iter, cores = 4)
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+```
+
+## Final Model Interpretation and Diagnostics
+
+After a thorough process of modeling and refinement, we have arrived at our Final Model. This model has been streamlined to focus on the most informative parameters for predicting customer churn.
+
+### Extracting and Analyzing the Final Model
+
+We extract the posterior distributions of the model parameters and perform diagnostic checks to ensure the model's reliability.
+
+```{r}
+# Extract posterior distributions for the final model
+posterior <- extract(stan_fit_updated)
+posterior_alpha <- posterior$alpha
+posterior_beta <- posterior$beta
+
+# Generate parameter names for the final model
+pars <- create_parameter_names(k)
+
+# Extract diagnostics and summary for the final model
+diagnostics_final <- extract_diagnostics(stan_fit_updated, pars)
+performance_summary_final <- model_performance_summary(stan_fit_updated, pars, execution_time, "Final Model")
+
+combined_performance_summary <- rbind(combined_performance_summary, performance_summary_final)
+
+```
+
+### Comparing Diagnostics Across Model Iterations
+
+We compare the diagnostics across different iterations of the model to assess improvements and the impact of our refinements.
+
+```{r}
+print(diagnostics)
+print(diagnostics_lasso)
+print(diagnostics_final)
+
+print(combined_performance_summary)
+```
+
+### Visualization of the Final Model
+
+Visualizations provide further insights into the model's performance and parameter interactions.
+
+```{r}
+# Traceplot for convergence and mixing
+traceplot(stan_fit_updated, pars = pars)
+
+# Histogram of posterior distributions
+mcmc_hist(stan_fit_updated, pars = pars)
+
+# Autocorrelation function for samples
+mcmc_acf(stan_fit_updated, pars = pars)
+
+# Comparative visualization of posterior distributions
+mcmc_areas(stan_fit_updated, pars = pars)
+
+# Parallel coordinates plot for posterior matrix
+posterior_matrix <- as.matrix(data.frame(alpha = posterior$alpha, beta = posterior$beta))
+mcmc_parcoord(posterior_matrix)
+
+# Calculate and visualize the correlation matrix
+correlation_matrix <- cor(posterior_matrix)
+heatmaply(correlation_matrix, width = 800, height = 800)
+```
+
+### Conclusions
+
+Our Final Model has successfully pinpointed the key parameters for predicting customer churn in a hypothetical telecommunications company. The most informative predictors identified are the possession of an international plan, the total amount of credits charged, and the frequency of calls to customer service. 
+
+Our statistical analysis highlighted that coefficients for `beta[3]` (Total Minutes) and `beta[6]` (Total International Minutes) were less relevant, marked by significant uncertainty due to their standard deviations exceeding the mean values. Consequently, these variables were excluded, simplifying the model without compromising its predictive capability.
+
+Ultimately, the Final Model's enhanced performance was evident in its reduced computational time, improved leave-one-out cross-validation (looic), and increased Effective Sample Size (ESS) for beta parameters. These improvements collectively demonstrate the model's robustness and reliability in predicting churn.
+
+This analysis reaffirms the effectiveness of Bayesian modeling in extracting meaningful insights from data, providing a solid foundation for developing targeted strategies to reduce customer churn in the telecom sector.
+
